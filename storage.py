@@ -5,7 +5,17 @@ import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json")
+from dotenv import load_dotenv
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# bot.py imports this module before it calls load_dotenv(), so load the .env here
+# too (a no-op to repeat) or DATA_DIR set there would be missed.
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+# DATA_DIR lets data.json live somewhere other than next to the code, e.g. a
+# mounted volume in Docker. Defaults to the code folder, as before.
+DATA_DIR = os.path.abspath(os.getenv("DATA_DIR") or BASE_DIR)
+DATA_FILE = os.path.join(DATA_DIR, "data.json")
 
 logger = logging.getLogger("storage")
 
@@ -87,6 +97,7 @@ def _save(data: Dict[str, Any]) -> None:
     # Write to a temp file then swap it in, so a crash mid-write can't
     # leave a half-written data.json behind.
     directory = os.path.dirname(DATA_FILE)
+    os.makedirs(directory, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:

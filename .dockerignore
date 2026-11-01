@@ -1,0 +1,22 @@
+# Secrets and runtime state must never be baked into the image
+.env
+cookies.txt
+data.json*
+logs/
+
+# Not needed to run the bot
+.git/
+.gitignore
+.github/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+tests/
+requirements-dev.txt
+*.bat
+*.ps1
+README.md
+Dockerfile
+.dockerignore
+docker-compose.yml

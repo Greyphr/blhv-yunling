@@ -57,6 +57,33 @@ python bot.py
 Keep this running (a small VPS, Raspberry Pi, or always-on PC works well —
 free hosts like Railway or a home server are common choices).
 
+### Docker
+
+```bash
+cp .env.example .env      # fill in DISCORD_TOKEN, TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET
+docker compose up -d --build
+docker compose logs -f
+```
+
+- The image includes Python, ffmpeg, libopus and a JavaScript runtime (deno) for
+  yt-dlp, and runs as a non-root user. `.env` is **not** copied into the image;
+  compose passes it in at run time.
+- `data.json` and `logs/` live on the `bot-data` volume (mounted at `/data`, set
+  by `DATA_DIR`), so they survive rebuilds and `docker compose down`. To bring
+  over an existing `data.json`:
+  `docker compose cp ./data.json bot:/data/data.json` (run after the first `up`),
+  then `docker compose restart`.
+- Logs are also printed to the console, so `docker compose logs` works.
+- yt-dlp updates itself on every start (needs internet). Set
+  `AUTO_UPDATE_YTDLP=0` in `.env` to turn that off, and rebuild the image
+  (`docker compose build --no-cache`) when you want a newer one.
+- Using `COOKIES_FILE`? Uncomment the cookies mount in `docker-compose.yml`.
+- Without compose:
+  `docker build -t yunling-bot .` then
+  `docker run -d --name yunling-bot --restart unless-stopped --env-file .env -v bot-data:/data yunling-bot`
+- Don't run the same bot token in Docker and on another machine at the same
+  time, or announcements will be posted twice.
+
 ### Windows: one-click start + auto-start
 
 - **`start_bot.bat`** — installs dependencies and starts `bot.py`. It checks

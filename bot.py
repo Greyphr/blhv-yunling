@@ -96,7 +96,7 @@ def setup_logging() -> None:
     redirected file, and echoing every log line there would bloat bot.err (and
     crash-history.log) without adding anything bot.log doesn't already have."""
     root = logging.getLogger()
-    logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    logs_dir = os.path.join(storage.DATA_DIR, "logs")
     os.makedirs(logs_dir, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -116,16 +116,17 @@ def setup_logging() -> None:
     file_handler.setFormatter(fmt)
     root.addHandler(file_handler)
 
-    # Console echo only for a real interactive terminal. A broken isatty()
-    # counts as "not a terminal", so a redirected stderr (a regular file) never
-    # gets the console handler.
+    # Console echo only for a real interactive terminal, or when LOG_TO_CONSOLE=1
+    # (set in the Docker image, where there is no tty but `docker logs` reads
+    # stderr). A broken isatty() counts as "not a terminal", so a redirected
+    # stderr (a regular file) never gets the console handler by default.
     err = sys.stderr
     if err is not None:
         try:
             is_tty = bool(getattr(err, "isatty", lambda: False)())
         except Exception:
             is_tty = False
-        if is_tty:
+        if is_tty or os.getenv("LOG_TO_CONSOLE") == "1":
             console_handler = logging.StreamHandler(err)
             console_handler._bot_owned = True
             console_handler.setFormatter(fmt)
@@ -242,7 +243,13 @@ async def backfill_legacy_entries():
 
 
 async def setup_hook():
-    await bot.tree.sync()
+    try:
+        await bot.tree.sync()
+    except discord.HTTPException:
+        # A failed sync (e.g. rate-limited) must not stop the bot starting: the
+        # previously synced commands keep working, and under a restart policy a
+        # crash here would just retry the sync in a tight loop.
+        logger.exception("Could not sync application commands; continuing with the existing ones")
     if not check_streams.is_running():
         check_streams.start()
     if not bot.customs_reminder_loop.is_running():
@@ -260,7 +267,8 @@ async def on_ready():
     _ready_done = True
     logger.info("Logged in as %s", bot.user)
     await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.watching, name="watching twitch 👀")
+        # The "Watching" prefix is added by Discord, so don't repeat it here.
+        activity=discord.Activity(type=discord.ActivityType.watching, name="twitch 👀")
     )
     try:
         await migrate_legacy_data()

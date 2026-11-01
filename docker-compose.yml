@@ -1,0 +1,22 @@
+services:
+  bot:
+    build: .
+    image: yunling-bot
+    container_name: yunling-bot
+    restart: unless-stopped
+    # DISCORD_TOKEN, TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET (and optional settings)
+    # come from your .env file (copy .env.example to .env). The file itself is
+    # never copied into the image.
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      # data.json (watched streamers, events, timezones) and logs/ live here.
+      - bot-data:/data
+      # If YouTube blocks you, export cookies to ./cookies.txt, uncomment this and
+      # set COOKIES_FILE=cookies.txt in .env. Do not mount it read-only: yt-dlp
+      # writes refreshed cookies back to the file.
+      # - ./cookies.txt:/app/cookies.txt
+
+volumes:
+  bot-data:

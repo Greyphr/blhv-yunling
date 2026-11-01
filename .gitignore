@@ -1,5 +1,7 @@
 # Secrets - never commit real credentials
 .env
+# YouTube login cookies (COOKIES_FILE) - these are a live session, treat as a password
+cookies.txt
 
 # Runtime state / per-server chatter data. data.json changes constantly and holds
 # Discord guild IDs + watched streamer lists; the bot creates it automatically.
@@ -13,3 +15,5 @@ logs/
 # Python
 __pycache__/
 *.py[cod]
+.venv/
+.pytest_cache/

@@ -15,6 +15,9 @@ logger = logging.getLogger("customs")
 
 REMINDER_MINUTES_BEFORE = 15
 CHECK_INTERVAL_SECONDS = 30
+# An event this long past its start is considered missed (bot was down): no late
+# "starting now" posts or DMs, the flags are just closed out.
+STALE_AFTER = timedelta(minutes=10)
 
 # Permission required for /create, /end, /setcustomschannel, /settimezone.
 # Kept separate from bot.py's REQUIRED_PERMS to avoid a circular import;
@@ -42,16 +45,6 @@ def _parse_event_datetime(text: str, tz_name: str):
     cleaned = text.strip().upper().replace(".", "")
     formats = ["%m/%d %I:%M %p", "%m/%d %I:%M%p", "%m/%d %H:%M"]
 
-    parsed = None
-    for fmt in formats:
-        try:
-            parsed = datetime.strptime(cleaned, fmt)
-            break
-        except ValueError:
-            continue
-    if parsed is None:
-        return None
-
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
@@ -59,16 +52,30 @@ def _parse_event_datetime(text: str, tz_name: str):
         return None
 
     now_local = datetime.now(tz)
-    candidate = parsed.replace(year=now_local.year, tzinfo=tz)
 
-    # If the date/time already passed this year, assume they mean next year.
-    if candidate < now_local - timedelta(minutes=5):
-        candidate = candidate.replace(year=now_local.year + 1)
+    # Parse with an explicit year. strptime without one defaults to 1900 (not a
+    # leap year, so "02/29" could never parse) and is deprecated in Python 3.13+.
+    # Try this year first, then next year: if the date/time already passed this
+    # year they mean next year, and a date like 02/29 may only exist in one of
+    # the two.
+    for year in (now_local.year, now_local.year + 1):
+        parsed = None
+        for fmt in formats:
+            try:
+                parsed = datetime.strptime(f"{year} {cleaned}", f"%Y {fmt}")
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            continue
+        candidate = parsed.replace(tzinfo=tz)
+        if candidate <= now_local:
+            if candidate >= now_local - timedelta(minutes=5):
+                return None  # just passed: a typo, not a request for next year
+            continue
+        return candidate
 
-    if candidate <= now_local:
-        return None
-
-    return candidate
+    return None
 
 
 def _build_event_embed(event: dict) -> discord.Embed:
@@ -135,19 +142,29 @@ class ReminderView(discord.ui.View):
             )
             return
 
+        # Acknowledge right away: a DM can easily take longer than the 3 seconds
+        # Discord gives us to respond, which would show "interaction failed".
+        await interaction.response.defer(ephemeral=True)
+
+        dm_ok = True
         try:
             await interaction.user.send(
                 f"Got you! 🎮 I'll let you know when it's {REMINDER_MINUTES_BEFORE} minutes "
                 f"to the Marvel Rivals {event['type'].lower()}."
             )
         except discord.Forbidden:
-            pass  # DMs closed; the reminder just won't arrive, not worth erroring over.
+            dm_ok = False
         except discord.HTTPException:
+            dm_ok = False
             logger.exception("Could not DM %s after Set Reminder click", interaction.user.id)
 
-        await interaction.response.send_message(
-            f"✅ I'll remind you {REMINDER_MINUTES_BEFORE} minutes before it starts!", ephemeral=True
-        )
+        message = f"✅ I'll remind you {REMINDER_MINUTES_BEFORE} minutes before it starts!"
+        if not dm_ok:
+            message += (
+                "\n⚠️ I couldn't send you a DM. Allow direct messages from server members "
+                "(Server → Privacy Settings), or the reminder won't reach you."
+            )
+        await interaction.followup.send(message, ephemeral=True)
 
 
 class MarvelRivalsModal(discord.ui.Modal):
@@ -159,14 +176,17 @@ class MarvelRivalsModal(discord.ui.Modal):
             label="Banner Image URL",
             placeholder="https://i.imgur.com/example.png",
             required=True,
+            max_length=500,
         )
         self.datetime_str = discord.ui.TextInput(
             label="Date & Time (MM/DD HH:MM AM/PM)",
             placeholder="12/25 8:00 PM",
             required=True,
+            max_length=30,
         )
-        self.room_name = discord.ui.TextInput(label="Room Name", required=True)
-        self.room_password = discord.ui.TextInput(label="Room Password", required=True)
+        # Embed field values are capped at 1024 characters; keep these well under.
+        self.room_name = discord.ui.TextInput(label="Room Name", required=True, max_length=100)
+        self.room_password = discord.ui.TextInput(label="Room Password", required=True, max_length=100)
 
         self.add_item(self.banner_url)
         self.add_item(self.datetime_str)
@@ -213,9 +233,24 @@ class MarvelRivalsModal(discord.ui.Modal):
             )
             return
 
+        room_name = self.room_name.value.strip()
+        room_password = self.room_password.value.strip()
+        if not room_name or not room_password:
+            # Whitespace-only input passes `required=True` but would make an
+            # empty embed field, which Discord rejects.
+            await interaction.response.send_message(
+                "❌ Room name and room password can't be blank. Please run `/create` again.",
+                ephemeral=True,
+            )
+            return
+
+        # Resolving the channel and posting can take a moment; acknowledge now so
+        # the 3-second response window can't expire mid-way.
+        await interaction.response.defer(ephemeral=True)
+
         channel = await _resolve_channel(customs_channel_id)
         if channel is None:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ I can't access the configured customs channel anymore (it may have been "
                 "deleted, or I lost permissions). Run `/setcustomschannel` again.",
                 ephemeral=True,
@@ -228,8 +263,8 @@ class MarvelRivalsModal(discord.ui.Modal):
             "type": self.event_type,
             "banner_url": banner_url,
             "timestamp": int(event_dt.timestamp()),
-            "room_name": self.room_name.value.strip(),
-            "room_password": self.room_password.value.strip(),
+            "room_name": room_name,
+            "room_password": room_password,
             "created_by": interaction.user.id,
             "channel_id": customs_channel_id,
             "message_id": None,
@@ -239,7 +274,6 @@ class MarvelRivalsModal(discord.ui.Modal):
             "disabled": False,
             "reminding_users": [],
         }
-        storage.create_event(guild_id, event_id, event)
 
         embed = _build_event_embed(event)
         view = ReminderView(guild_id, event_id)
@@ -252,14 +286,18 @@ class MarvelRivalsModal(discord.ui.Modal):
             )
         except discord.HTTPException:
             logger.exception("[%s] Failed to post customs announcement", guild_id)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Something went wrong posting that announcement. Nothing was sent.",
                 ephemeral=True,
             )
             return
 
-        storage.update_event(guild_id, event_id, message_id=message.id)
-        await interaction.response.send_message(
+        # Only store the event once the post succeeded. Storing it first left an
+        # orphan record behind on a failed send, and the reminder loop would
+        # later announce "starting now" for an event nobody ever saw.
+        event["message_id"] = message.id
+        storage.create_event(guild_id, event_id, event)
+        await interaction.followup.send(
             f"✅ Announcement posted in {channel.mention}!", ephemeral=True
         )
 
@@ -324,8 +362,10 @@ def register_persistent_views(bot: discord.Client) -> None:
     restart -- mirrors how bot.py handles its own startup state."""
     for guild_id, guild in storage.get_all_guilds().items():
         for event_id, event in guild.get("events", {}).items():
-            if not event.get("ended"):
-                bot.add_view(ReminderView(int(guild_id), event_id, disabled=event.get("disabled", False)))
+            # Ended events are registered too: their button stays clickable on the
+            # old post, and without a registered view a click after a restart just
+            # shows "interaction failed" instead of "this event was cancelled".
+            bot.add_view(ReminderView(int(guild_id), event_id, disabled=event.get("disabled", False)))
 
 
 def setup(bot: discord.Client, resolve_channel, announce_channel_types) -> None:
@@ -404,6 +444,9 @@ def setup(bot: discord.Client, resolve_channel, announce_channel_types) -> None:
 
         storage.update_event(guild_id, event, ended=True)
 
+        # DMing every subscriber can take well over 3 seconds; acknowledge first.
+        await interaction.response.defer(ephemeral=True)
+
         notified = 0
         for user_id in event_data.get("reminding_users", []):
             try:
@@ -416,7 +459,7 @@ def setup(bot: discord.Client, resolve_channel, announce_channel_types) -> None:
             except (discord.Forbidden, discord.NotFound, discord.HTTPException):
                 continue
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"✅ Event ended. Notified {notified} user(s) who had a reminder set.", ephemeral=True
         )
 
@@ -457,9 +500,14 @@ async def _run_reminder_check_once(bot: discord.Client) -> None:
 async def _check_single_event(bot, guild_id: int, event_id: str, event: dict, now: datetime) -> None:
     event_dt = datetime.fromtimestamp(event["timestamp"], tz=timezone.utc)
     remind_at = event_dt - timedelta(minutes=REMINDER_MINUTES_BEFORE)
+    # If the bot was offline through the start time, don't send "starting now"
+    # (or "15 minutes to go") hours late; just mark those steps done.
+    stale = now >= event_dt + STALE_AFTER
 
     if not event.get("reminder_sent") and now >= remind_at:
-        for user_id in event.get("reminding_users", []):
+        # Once the event has begun the "starting now" message below covers it, so
+        # the "15 minutes until" DM would only be wrong.
+        for user_id in (event.get("reminding_users", []) if now < event_dt else []):
             try:
                 user = bot.get_user(user_id) or await bot.fetch_user(user_id)
                 await user.send(
@@ -472,7 +520,7 @@ async def _check_single_event(bot, guild_id: int, event_id: str, event: dict, no
         storage.update_event(guild_id, event_id, reminder_sent=True)
 
     if not event.get("started_announced") and now >= event_dt:
-        for user_id in event.get("reminding_users", []):
+        for user_id in (event.get("reminding_users", []) if not stale else []):
             try:
                 user = bot.get_user(user_id) or await bot.fetch_user(user_id)
                 await user.send(
@@ -482,7 +530,7 @@ async def _check_single_event(bot, guild_id: int, event_id: str, event: dict, no
             except (discord.Forbidden, discord.NotFound, discord.HTTPException):
                 continue
 
-        channel = await _resolve_channel(event["channel_id"])
+        channel = None if stale else await _resolve_channel(event["channel_id"])
         if channel is not None:
             try:
                 reply_to = (
